@@ -1,0 +1,11 @@
+{
+  "id": "rescue",           
+  "name": "救援队友",
+  "author": "TongsKing",
+  "description": "可以攻击队友尸体救援队友",
+  "version": "1.0",
+  "has_pck": false,         
+  "has_dll": true,        
+  "dependencies": [""],     
+  "affects_gameplay": true 
+}
