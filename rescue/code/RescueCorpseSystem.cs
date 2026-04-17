@@ -91,6 +91,14 @@ internal static class RescueCorpseManager
 
 	private static readonly AsyncLocal<int> _bypassCreatureDamagePatchDepth = new AsyncLocal<int>();
 
+	private static readonly MethodInfo? _hookBeforePlayPhaseStartTwoArgMethod = AccessTools.Method(typeof(Hook), "BeforePlayPhaseStart", new Type[2]
+	{
+		typeof(CombatState),
+		typeof(Player)
+	});
+
+	private static readonly MethodInfo? _hookBeforePlayPhaseStartFourArgMethod = AccessTools.GetDeclaredMethods(typeof(Hook)).FirstOrDefault((MethodInfo method) => method.Name == "BeforePlayPhaseStart" && method.GetParameters().Length == 4);
+
 	private static readonly HashSet<ulong> _recentlyRevivedCorpsePlayers = new HashSet<ulong>();
 
 	private static bool _clearRecentRevivesQueued;
@@ -580,8 +588,115 @@ internal static class RescueCorpseManager
 		await player.PlayerCombatState.OrbQueue.AfterTurnStart(choiceContext);
 		if (combatState.CurrentSide == CombatSide.Player)
 		{
-			await Hook.BeforePlayPhaseStart(combatState, player);
+			await BeforePlayPhaseStartCompat(combatState, player);
 		}
+	}
+
+	private static async Task BeforePlayPhaseStartCompat(CombatState combatState, Player player)
+	{
+		Task? hookTask = _hookBeforePlayPhaseStartTwoArgMethod?.Invoke(null, new object[2] { combatState, player }) as Task;
+		if (hookTask != null)
+		{
+			await hookTask;
+			return;
+		}
+		if (_hookBeforePlayPhaseStartFourArgMethod == null)
+		{
+			return;
+		}
+		ulong? netId = LocalContext.NetId;
+		if (!netId.HasValue)
+		{
+			return;
+		}
+		foreach (AbstractModel model in combatState.IterateHookListeners())
+		{
+			if (!TryCreateHookPlayerChoiceContext(model, netId.Value, combatState, out HookPlayerChoiceContext? hookPlayerChoiceContext))
+			{
+				continue;
+			}
+			Task task = model.BeforePlayPhaseStart(hookPlayerChoiceContext, player);
+			Task? fourArgTask = _hookBeforePlayPhaseStartFourArgMethod.Invoke(null, new object[4] { hookPlayerChoiceContext, task, combatState, player }) as Task;
+			if (fourArgTask != null)
+			{
+				await fourArgTask;
+			}
+			else
+			{
+				await hookPlayerChoiceContext.AssignTaskAndWaitForPauseOrCompletion(task);
+			}
+			model.InvokeExecutionFinished();
+		}
+	}
+
+	private static bool TryCreateHookPlayerChoiceContext(AbstractModel model, ulong netId, CombatState combatState, out HookPlayerChoiceContext? context)
+	{
+		context = null;
+		foreach (ConstructorInfo constructor in typeof(HookPlayerChoiceContext).GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+		{
+			ParameterInfo[] parameters = constructor.GetParameters();
+			object[] ctorArgs = new object[parameters.Length];
+			bool canInvoke = true;
+			for (int i = 0; i < parameters.Length; i++)
+			{
+				Type parameterType = parameters[i].ParameterType;
+				if (parameterType.IsAssignableFrom(typeof(AbstractModel)))
+				{
+					ctorArgs[i] = model;
+					continue;
+				}
+				if (parameterType == typeof(ulong) || parameterType == typeof(ulong?))
+				{
+					ctorArgs[i] = netId;
+					continue;
+				}
+				if (parameterType.IsAssignableFrom(typeof(CombatState)))
+				{
+					ctorArgs[i] = combatState;
+					continue;
+				}
+				if (parameterType.IsAssignableFrom(typeof(Player)))
+				{
+					ctorArgs[i] = (model as CardModel)?.Owner ?? (model as RelicModel)?.Owner ?? combatState.Players[0];
+					continue;
+				}
+				if (parameterType.IsEnum)
+				{
+					Array enumValues = Enum.GetValues(parameterType);
+					if (enumValues.Length == 0)
+					{
+						canInvoke = false;
+						break;
+					}
+					object enumValue = enumValues.Cast<object>().FirstOrDefault((object value) => value.ToString()?.Equals("Combat", StringComparison.OrdinalIgnoreCase) == true) ?? enumValues.GetValue(0)!;
+					ctorArgs[i] = enumValue;
+					continue;
+				}
+				if (parameters[i].HasDefaultValue)
+				{
+					ctorArgs[i] = parameters[i].DefaultValue!;
+					continue;
+				}
+				canInvoke = false;
+				break;
+			}
+			if (!canInvoke)
+			{
+				continue;
+			}
+			try
+			{
+				context = constructor.Invoke(ctorArgs) as HookPlayerChoiceContext;
+				if (context != null)
+				{
+					return true;
+				}
+			}
+			catch
+			{
+			}
+		}
+		return false;
 	}
 
 	private static async Task RunPseudoTurnEndForReviveAsync(PlayerChoiceContext choiceContext, CombatState combatState, Player player)
